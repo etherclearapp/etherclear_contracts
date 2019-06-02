@@ -38,7 +38,17 @@ import "openzeppelin-solidity/contracts/math/SafeMath.sol";
  * Some parts are modified from https://github.com/forkdelta/smart_contract/blob/master/contracts/ForkDelta.sol
 */
 
+/*
+ * This is used as an interface to provide functionality when setting up the contract with ENS.
+*/
+contract ReverseRegistrar {
+    function setName(string memory name) public returns (bytes32);
+}
+
 contract Etherclear {
+    /*
+    * The dictionary is used as an iterable mapping implementation.
+    */
     using Dictionary for Dictionary.Data;
 
     // TODO: think about adding a ERC223 fallback method.
@@ -92,6 +102,8 @@ contract Etherclear {
         PaymentState state;
     }
 
+    ReverseRegistrar reverseRegistrar;
+
     // EIP-712 code uses the examples provided at
     // https://medium.com/metamask/eip712-is-coming-what-to-expect-and-how-to-use-it-bb92fd1a7a26
     // TODO: the salt and verifyingContract still need to be changed.
@@ -102,7 +114,23 @@ contract Etherclear {
         string passphrase;
     }
 
-    uint256 constant chainId = 3;
+    // Payments where msg.sender is the recipient.
+    mapping(address => Dictionary.Data) recipientPayments;
+    // Payments where msg.sender is the sender.
+    mapping(address => Dictionary.Data) senderPayments;
+    // Payments are looked up with a uint UUID generated within the contract.
+    mapping(uint => Payment) allPayments;
+
+    // This contract's owner (gives ability to set fees).
+    address payable owner;
+    // The fees are represented with a percentage times 1 ether.
+    // The baseFee is to cover feeless retrieval
+    // The paymentFee is to cover development costs
+    uint baseFee;
+    uint paymentFee;
+    // mapping of token addresses to mapping of account balances (token=0 means Ether)
+    mapping(address => mapping(address => uint)) public tokens;
+
     address constant verifyingContract = 0x1C56346CD2A2Bf3202F771f50d3D14a367B48070;
     bytes32 constant salt = 0xf2d857f4a3edcb9b78b4d503bfe733db1e3f6cdc2b7971ee739626c97e86a558;
     string private constant RETRIEVE_FUNDS_REQUEST_TYPE = "RetrieveFundsRequest(uint256 txnId,address sender,address recipient,string passphrase)";
@@ -113,20 +141,12 @@ contract Etherclear {
     bytes32 private constant RETRIEVE_FUNDS_REQUEST_TYPEHASH = keccak256(
         abi.encodePacked(RETRIEVE_FUNDS_REQUEST_TYPE)
     );
-    bytes32 private constant DOMAIN_SEPARATOR = keccak256(
-        abi.encode(
-            EIP712_DOMAIN_TYPEHASH,
-            keccak256("EtherClear"),
-            keccak256("1"),
-            chainId,
-            verifyingContract,
-            salt
-        )
-    );
+    bytes32 private DOMAIN_SEPARATOR;
+    uint256 chainId;
 
     function hashRetrieveFundsRequest(RetrieveFundsRequest memory request)
         private
-        pure
+        view
         returns (bytes32 hash)
     {
         return keccak256(
@@ -152,7 +172,7 @@ contract Etherclear {
         bytes32 sigR,
         bytes32 sigS,
         uint8 sigV
-    ) private pure returns (address result) {
+    ) private view returns (address result) {
         return ecrecover(hashRetrieveFundsRequest(request), sigV, sigR, sigS);
     }
 
@@ -165,7 +185,7 @@ contract Etherclear {
         bytes32 sigR,
         bytes32 sigS,
         uint8 sigV
-    ) public pure returns (address result) {
+    ) public view returns (address result) {
         RetrieveFundsRequest memory request = RetrieveFundsRequest(
             txnId,
             sender,
@@ -181,27 +201,25 @@ contract Etherclear {
         return verify(recipient, request, sigR, sigS, sigV);
     }
 
-    // Payments where msg.sender is the recipient.
-    mapping(address => Dictionary.Data) recipientPayments;
-    // Payments where msg.sender is the sender.
-    mapping(address => Dictionary.Data) senderPayments;
-
-    mapping(uint => Payment) allPayments;
-    // The limit in seconds that any sender can set the hold time to.
-    // Meant to protect senders from leaving the funds exposed through
-    // setting the hold time to months, years or decades.
-    uint holdTimeUpperLimit;
-    // This contract's owner (gives ability to set the hold time upper limit and fee).
-    address payable owner;
-    uint feeAmount;
-    // mapping of token addresses to mapping of account balances (token=0 means Ether)
-    mapping(address => mapping(address => uint)) public tokens;
-
-    constructor() public {
-        // Set upper limit for holding funds to 7 days.
-        holdTimeUpperLimit = 7 * 60 * 60 * 24;
+    constructor(uint256 _chainId) public {
         owner = msg.sender;
-        feeAmount = 0.001 ether;
+        baseFee = 0.001 ether;
+        paymentFee = 0.005 ether;
+        chainId = _chainId;
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                EIP712_DOMAIN_TYPEHASH,
+                keccak256("Etherclear"),
+                keccak256("1"),
+                chainId,
+                verifyingContract,
+                salt
+            )
+        );
+    }
+
+    function getChainId() public pure returns (uint256 chainId) {
+        return chainId;
     }
 
     modifier onlyOwner {
@@ -212,24 +230,55 @@ contract Etherclear {
         _;
     }
 
-    function withdrawFees() external onlyOwner {
-        uint total = tokens[address(0)][owner];
-        tokens[address(0)][owner] = 0;
-        owner.transfer(total);
+    /*
+    * SetENS sets the name of the reverse record so that it points to this contract address.
+    */
+    function setENS(address reverseRegistrarAddr, string memory name)
+        public
+        onlyOwner
+    {
+        reverseRegistrar = ReverseRegistrar(reverseRegistrarAddr);
+        reverseRegistrar.setName(name);
+
+    }
+
+    function withdrawFees(address token) external onlyOwner {
+        // The "owner" account is considered the fee account.
+        uint total = tokens[token][owner];
+        tokens[token][owner] = 0;
+        if (token == address(0)) {
+            owner.transfer(total);
+        } else {
+            require(
+                IERC20(token).transfer(owner, total),
+                "Could not successfully withdraw token"
+            );
+        }
+    }
+
+    function viewBalance(address token, address user)
+        external
+        view
+        returns (uint balance)
+    {
+        return tokens[token][user];
     }
 
     // TODO: change this so that the fee can only be decreased
     // (once a suitable starting fee is reached).
-    function changeFee(uint newFee) external onlyOwner {
-        feeAmount = newFee;
+    function changeBaseFee(uint newFee) external onlyOwner {
+        baseFee = newFee;
+    }
+    function changePaymentFee(uint newFee) external onlyOwner {
+        paymentFee = newFee;
     }
 
-    function getFeeAmount() public view returns (uint feeAmt) {
-        return feeAmount;
+    function getBaseFee() public view returns (uint feeAmt) {
+        return baseFee;
     }
 
-    function setHoldTimeUpperLimit(uint limit) public onlyOwner {
-        holdTimeUpperLimit = limit;
+    function getPaymentFee() public view returns (uint feeAmt) {
+        return paymentFee;
     }
 
     function getPaymentsForSender()
@@ -278,7 +327,7 @@ contract Etherclear {
     // Cancels the payment and returns the funds to the payment's sender.
     function cancelPayment(uint txnId) external {
         // Check txn sender and state.
-        Payment storage txn = allPayments[txnId];
+        Payment memory txn = allPayments[txnId];
         require(
             txn.sender == msg.sender,
             "Payment sender does not match message sender."
@@ -291,6 +340,10 @@ contract Etherclear {
         // Update txn state.
         txn.paymentCloseTime = now;
         txn.state = PaymentState.CANCELLED;
+
+        delete allPayments[txnId];
+        recipientPayments[txn.recipient].remove(txnId);
+        senderPayments[txn.sender].remove(txnId);
 
         // Return funds to sender.
         if (txn.token == address(0)) {
@@ -315,36 +368,47 @@ contract Etherclear {
             txn.codeHash,
             uint(txn.state)
         );
-
-        // TODO: move these before the withdraw.
-        delete allPayments[txnId];
-        recipientPayments[txn.recipient].remove(txnId);
-        senderPayments[txn.sender].remove(txnId);
     }
 
-/**
-* This function handles deposits of Ethereum based tokens to the contract.
+    /**
+* This function handles deposits of ERC-20 tokens to the contract.
 * Does not allow Ether.
 * If token transfer fails, payment is reverted and remaining gas is refunded.
-* Emits a Deposit event.
+* Additionally, includes a fee which must be accounted for when approving the amount.
 * Note: Remember to call Token(address).approve(this, amount) or this contract will not be able to do the transfer on your behalf.
 * @param token Ethereum contract address of the token or 0 for Ether
-* @param amount uint of the amount of the token the user wishes to deposit
+* @param originalAmount uint of the amount of the token the user wishes to deposit
+* @param feeAmount uint total amount of the fee charged by the contract
 */
     // TODO: this doesn't follow checks-effects-interactions
     // https://solidity.readthedocs.io/en/develop/security-considerations.html?highlight=check%20effects#use-the-checks-effects-interactions-pattern
-    function depositToken(address token, address user, uint amount) internal {
+    function transferToken(
+        address token,
+        address user,
+        uint originalAmount,
+        uint feeAmount
+    ) internal {
         require(token != address(0));
         // TODO: use depositingTokenFlag in the ERC223 fallback function
         //depositingTokenFlag = true;
-        require(IERC20(token).transferFrom(user, address(this), amount));
+        require(
+            IERC20(token).transferFrom(
+                user,
+                address(this),
+                SafeMath.add(originalAmount, feeAmount)
+            )
+        );
         //depositingTokenFlag = false;
-        tokens[token][user] = SafeMath.add(tokens[token][msg.sender], amount);
+        tokens[token][user] = SafeMath.add(
+            tokens[token][msg.sender],
+            originalAmount
+        );
+        tokens[token][owner] = SafeMath.add(tokens[token][owner], feeAmount);
     }
 
-    // Make sure to check if amounts are available
-    // TODO: it's not really clear that balances are never
-    // incremented in this function.
+    // TODO: Make sure to check if amounts are available
+    // We don't increment any balances because the funds are sent
+    // outside of the contract.
     function withdrawToken(
         address token,
         address userFrom,
@@ -376,9 +440,9 @@ contract Etherclear {
 
     // Meant to be used for the approve() call, since the
     // amount in the ERC20 contract implementation will be
-    // overwritten.
-    // This returns the amount of the token that this
-    // contract still holds
+    // overwritten with the amount requested in the next approve().
+    // This returns the amount of the token that the
+    // contract still holds.
     // TODO: ensure this value will be correct.
     function getBalance(address token) external view returns (uint amt) {
         return tokens[token][msg.sender];
@@ -396,7 +460,11 @@ contract Etherclear {
         return txnId;
     }
     // Creates a new payment with the msg.sender as sender.
-    // Expected to take 0.001 ETH fee.
+    // Expected to take a base fee in ETH.
+    // Also takes a payment fee in either ETH or the token used,
+    // this payment fee is calculated from the original amount.
+    // We assume here that an approve() call has already been made for
+    // the original amount + payment fee.
     function createTokenPayment(
         address token,
         uint amount,
@@ -404,19 +472,26 @@ contract Etherclear {
         uint holdTime,
         bytes memory codeHash
     ) public payable {
-        // Check holdTime.
-        require(
-            holdTime <= holdTimeUpperLimit,
-            "Hold time is greater than upper limit"
+        // Check amount and fee, make sure to truncate fee.
+        uint paymentFeeTotal = uint(
+            SafeMath.mul(paymentFee, amount) / (1 ether)
         );
-        // Check amount and fee
         if (token == address(0)) {
             require(
-                msg.value >= (SafeMath.add(amount, feeAmount)),
-                "Message value is not enough to cover amount and fee"
+                msg.value >= (SafeMath.add(
+                    SafeMath.add(amount, baseFee),
+                    paymentFeeTotal
+                )),
+                "Message value is not enough to cover amount and fees"
             );
         } else {
-            require(msg.value >= feeAmount);
+            require(
+                msg.value >= baseFee,
+                "Message value is not enough to cover base fee"
+            );
+            // We don't check for a minimum when taking the paymentFee here. Since we don't
+            // care what the original sent amount was supposed to be, we just take a percentage and
+            // subtract that from the sent amount.
         }
 
         // Get payments for sender.
@@ -456,29 +531,28 @@ contract Etherclear {
 
         allPayments[txnId] = txn;
 
-        // TODO: is this the right place?
-        // TODO: this needs to be safer.
-        // Take fee.
+        // Take fees; mark ether or token balances.
         if (token == address(0)) {
+            // Mark sender's ether balance with the sent amount
+            tokens[address(0)][msg.sender] = SafeMath.add(
+                tokens[address(0)][msg.sender],
+                amount
+            );
+
+            // Take baseFee and paymentFee (and any ether sent in the message)
             tokens[address(0)][owner] = SafeMath.add(
                 tokens[address(0)][owner],
                 SafeMath.sub(msg.value, amount)
             );
+
         } else {
+            // Take baseFee (and any ether sent in the message)
             tokens[address(0)][owner] = SafeMath.add(
                 tokens[address(0)][owner],
                 msg.value
             );
-        }
-        // Transfer funds if tokens were specified.
-        if (token != address(0)) {
-            depositToken(token, msg.sender, amount);
-        } else {
-            tokens[address(0)][msg.sender] = SafeMath.add(
-                tokens[token][msg.sender],
-                amount
-            );
-
+            // Transfer tokens; mark sender's balance; take paymentFee
+            transferToken(token, msg.sender, amount, paymentFeeTotal);
         }
 
         // TODO: is this the best step to emit events?
@@ -497,6 +571,7 @@ contract Etherclear {
     }
 
     // Meant to be called by anyone, on behalf of the recipient.
+    // Will only work if the correct signature is passed in.
     function retrieveFundsForRecipient(
         uint256 txnId,
         address sender,
@@ -547,11 +622,9 @@ contract Etherclear {
     // Internal ONLY, because it does not do any checks with msg.sender,
     // and leaves that for calling functions.
     // TODO: find a more secure way to implement the recipient check.
-    function retrieveFunds(
-        Payment memory txn,
-        uint txnId,
-        string memory code
-    ) private {
+    function retrieveFunds(Payment memory txn, uint txnId, string memory code)
+        private
+    {
         // Check codeHash
         require(
             txn.state == PaymentState.OPEN,
@@ -576,8 +649,11 @@ contract Etherclear {
         txn.paymentCloseTime = now;
         txn.state = PaymentState.COMPLETED;
 
-        // Transfer either ether or tokens.
+        delete allPayments[txnId];
+        recipientPayments[txn.recipient].remove(txnId);
+        senderPayments[txn.sender].remove(txnId);
 
+        // Transfer either ether or tokens.
         if (txn.token == address(0)) {
             // Pay out retrieved funds based on payment amount
             // TODO: recipient must be valid!
@@ -603,11 +679,6 @@ contract Etherclear {
             txn.codeHash,
             uint(txn.state)
         );
-
-        // TODO: move these steps to happen before the withdraw.
-        delete allPayments[txnId];
-        recipientPayments[txn.recipient].remove(txnId);
-        senderPayments[txn.sender].remove(txnId);
 
     }
 
